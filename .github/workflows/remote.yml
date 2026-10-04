@@ -1,0 +1,29 @@
+name: Public DHT acceptance
+on:
+  workflow_dispatch:
+jobs:
+  network:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - run: node scripts/remote-test.mjs
+      - if: always()
+        run: node scripts/remote-test.mjs --cleanup-current
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-test-report
+          path: |
+            .remote-runs/**/manifest.json
+            .remote-runs/**/*.log
+          include-hidden-files: true

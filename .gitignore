@@ -1,0 +1,16 @@
+build/bin
+**/build/bin/
+node_modules
+frontend/dist
+**/frontend/dist/
+.remote-runs/
+/interweb-node
+/tools/bin/
+frontend/test-results/
+**/frontend/test-results/
+frontend/playwright-report/
+**/frontend/playwright-report/
+
+# Keep working notes local; publish only README Markdown files.
+*.[mM][dD]
+!README.md
