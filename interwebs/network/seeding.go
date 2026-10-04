@@ -15,6 +15,7 @@ func (t *Transport) SetSeeding(ctx context.Context, enabled bool) error {
 	if t.closed {
 		return fs.ErrClosed
 	}
+	changed := t.seeding != enabled
 	t.seeding = enabled
 	for _, transfer := range t.transfers {
 		if enabled {
@@ -22,6 +23,9 @@ func (t *Transport) SetSeeding(ctx context.Context, enabled bool) error {
 		} else {
 			transfer.torrent.DisallowDataUpload()
 		}
+	}
+	if changed {
+		t.wakePeers()
 	}
 	return nil
 }

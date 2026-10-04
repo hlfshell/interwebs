@@ -315,6 +315,15 @@ func (s *Site) publish(ctx context.Context) (Result, error) {
 	if !e.Owned {
 		return Result{}, errors.New("publication requires an owned source")
 	}
+	// A restored browser view must remain hosted even if source revalidation
+	// rejects the replacement. This only reads the already active stored version.
+	if e.Kind == "site" {
+		if n := s.currentNode(); n != nil && n.Status().Current != "" {
+			if err := n.Seed(ctx); err != nil {
+				return Result{}, fmt.Errorf("seed stored site: %w", err)
+			}
+		}
+	}
 	// Revalidate source permissions even when its Node is already active.
 	if _, err := s.source(ctx, e); err != nil {
 		return Result{}, err

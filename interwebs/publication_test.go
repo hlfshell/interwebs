@@ -7,12 +7,63 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hlfshell/interweb/interwebs/content"
 	"github.com/hlfshell/interweb/interwebs/network"
 	"github.com/hlfshell/interweb/interwebs/site"
 )
+
+type waitingSource struct {
+	content.Source
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (*waitingSource) EntryPoint() string { return "index.html" }
+func (s *waitingSource) Fingerprint(ctx context.Context) ([32]byte, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	return [32]byte{}, ctx.Err()
+}
+
+func TestRestartSeedsStoredVersionWhileReplacementIsPreparing(t *testing.T) {
+	first, opts, _ := localNode(t, "stored version")
+	publication, err := first.Publish(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source := &waitingSource{Source: first.source, entered: make(chan struct{})}
+	node, err := New(t.Context(), append(opts, WithContent(source))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	url, err := node.View(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := node.Publish(ctx); done <- err }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-source.entered:
+	case <-ctx.Done():
+		t.Fatal("publication did not reach source preparation")
+	}
+	status := node.Status()
+	if !status.Seeding || status.Current != publication.Record.Hash {
+		t.Fatalf("stored version not seeded during preparation: %+v", status)
+	}
+	checkPage(t, url, "stored version")
+}
 
 type failingSource struct {
 	content.Source

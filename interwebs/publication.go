@@ -2,7 +2,9 @@ package interwebs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 
 	"github.com/hlfshell/interweb/interwebs/content"
 )
@@ -10,6 +12,8 @@ import (
 // Publish snapshots the local source into an immutable version and enables seeding.
 // A local source and its matching signing key are required. Announcement
 // happens asynchronously; Status distinguishes persistence and announcement errors.
+// An existing stored version resumes seeding before source preparation, and stays
+// available if preparing its replacement fails.
 func (n *Node) Publish(ctx context.Context) (Publication, error) {
 	ctx, release, err := n.operation(ctx)
 	if err != nil {
@@ -22,6 +26,29 @@ func (n *Node) Publish(ctx context.Context) (Publication, error) {
 	source := n.source
 	if source == nil {
 		return Publication{}, fmt.Errorf("publish requires a local source and signer: %w", ErrCapability)
+	}
+
+	// Restore the published version before doing any work on its replacement.
+	n.mu.Lock()
+	current := n.state.Current
+	n.mu.Unlock()
+	if current != "" {
+		// A deliberately cleared cache has nothing to restore; rebuild it from
+		// the source instead of waiting for peers to return our own publication.
+		_, err := n.stores.Manifest(ctx, current)
+		if errors.Is(err, fs.ErrNotExist) {
+			current = ""
+		} else if err != nil {
+			return Publication{}, fmt.Errorf("read stored manifest: %w", err)
+		}
+	}
+	if current != "" {
+		if _, err := n.load(ctx, current); err != nil {
+			return Publication{}, fmt.Errorf("restore published version: %w", err)
+		}
+		if err := n.seed(ctx); err != nil {
+			return Publication{}, fmt.Errorf("seed stored version: %w", err)
+		}
 	}
 
 	if validator, ok := n.content.(interface {

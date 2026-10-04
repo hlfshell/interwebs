@@ -174,3 +174,116 @@ func TestSandboxedBackendRejectsWrongKey(t *testing.T) {
 		t.Fatal("accepted wrong key")
 	}
 }
+
+func TestStoredReaderCachesVerifiedBytesButRechecksAfterSeek(t *testing.T) {
+	s := testCollection(t)
+	m := testSnapshot(t, s)
+	v, err := s.Open(t.Context(), m.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	r, err := v.Open(t.Context(), "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	first := make([]byte, 1)
+	if _, err := io.ReadFull(r, first); err != nil || string(first) != "e" {
+		t.Fatal(first, err)
+	}
+	var info metainfo.Info
+	if err := bencode.Unmarshal(m.Metadata(), &info); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := s.OpenTorrent(t.Context(), &info, metainfo.NewHashFromHex(m.Hash()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if _, err := handle.Piece(info.Piece(0)).WriteAt([]byte("X"), 0); err != nil {
+		t.Fatal(err)
+	}
+	// Already authenticated bytes stay valid even if the backing file changes.
+	rest, err := io.ReadAll(r)
+	if err != nil || string(rest) != "ncrypted content" {
+		t.Fatal(string(rest), err)
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.Read(first); n != 0 || err == nil {
+		t.Fatalf("seek reused stale verification: %d, %v", n, err)
+	}
+}
+
+func TestCachedReaderHonorsCollectionClose(t *testing.T) {
+	s := testCollection(t)
+	m := testSnapshot(t, s)
+	v, err := s.Open(t.Context(), m.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	r, err := v.Open(t.Context(), "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.Read(make([]byte, 1)); n != 0 || !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("read after collection close: %d, %v", n, err)
+	}
+}
+
+func TestStoredReaderSmallReadsAcrossPiecesAndSeeks(t *testing.T) {
+	s := testCollection(t)
+	folder := t.TempDir()
+	payload := make([]byte, 2*(256<<10)+17)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "index.html"), payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := site.New(t.Context(), folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Snapshot(t.Context(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.Open(t.Context(), m.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	r, err := v.Open(t.Context(), "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	buffer := make([]byte, 97)
+	for offset := 0; offset < len(payload); {
+		n, err := r.Read(buffer)
+		if err != nil || n == 0 || !bytes.Equal(buffer[:n], payload[offset:offset+n]) {
+			t.Fatalf("read at %d: n=%d, err=%v", offset, n, err)
+		}
+		offset += n
+	}
+	for _, offset := range []int64{256<<10 - 3, 2 << 18, 0, int64(len(payload) - 1)} {
+		if _, err := r.Seek(offset, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		n, err := r.Read(buffer)
+		if err != nil || n == 0 || !bytes.Equal(buffer[:n], payload[offset:offset+int64(n)]) {
+			t.Fatalf("read after seek to %d: n=%d, err=%v", offset, n, err)
+		}
+	}
+}

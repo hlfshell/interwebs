@@ -115,6 +115,11 @@ func Open(ctx context.Context, root string, opts ...Option) (*App, error) {
 		a.profiles[id] = p
 	}
 	for _, p := range a.profiles {
+		if c.startPaused {
+			if err := p.Pause(ctx); err != nil {
+				return nil, errors.Join(err, a.Close())
+			}
+		}
 		p.start()
 	}
 	go func() {
@@ -224,7 +229,7 @@ func (a *App) CreateProfile(ctx context.Context, name string, opts ...ProfileOpt
 	if err != nil {
 		return fail(err)
 	}
-	state := profileState{Version: 1, ID: id, Name: name, Roots: roots, Settings: c.settings, Sites: make(map[string]entry)}
+	state := profileState{Version: 1, ID: id, Name: name, Roots: roots, Settings: c.settings, Paused: a.config.startPaused, Sites: make(map[string]entry)}
 	p := newProfile(a, dir, store, state)
 	if err := p.persist(ctx, state); err != nil {
 		return fail(err)

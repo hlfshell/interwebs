@@ -121,6 +121,8 @@ func (s *Collection) putInfo(hash string, info []byte) error {
 
 // mutate reserves staging and manifest headroom before any encrypted write.
 // The quota lock serializes reservations with cache accounting and other writes.
+// Between exact scans, sizes include conservative upper bounds, never estimates
+// below actual usage. Near the limit we reconcile before rejecting a write.
 func (s *Collection) mutate(hash string, growth int64, work func() error) error {
 	if s.quota == nil {
 		return work()
@@ -131,27 +133,45 @@ func (s *Collection) mutate(hash string, growth int64, work func() error) error 
 	if q.accountError != nil {
 		return fmt.Errorf("account encrypted storage: %w", q.accountError)
 	}
-	{
-		var used int64
-		for _, n := range q.sizes {
-			used += n
+	reserved, err := s.backend.Growth(context.Background(), hash, growth)
+	if err != nil {
+		return err
+	}
+	if reserved < 0 {
+		return errors.New("negative storage reservation")
+	}
+	if reserved > q.limit-q.used() {
+		for dirty := range q.pending {
+			if err := s.reconcile(dirty); err != nil {
+				return err
+			}
 		}
-		reserved, err := s.backend.Growth(context.Background(), hash, growth)
-		if err != nil {
-			return err
-		}
-		growth = reserved
-		if growth > q.limit-used {
+		if reserved > q.limit-q.used() {
 			return ErrBufferFull
 		}
 	}
-	err := work()
-	size, sizeErr := s.backend.Usage(context.Background(), hash)
-	q.sizes[hash] = size.Bytes
-	if sizeErr != nil {
-		q.accountError = sizeErr
+	q.sizes[hash] += reserved
+	q.pending[hash]++
+	err = work()
+	// Failed writes may leave temporary ciphertext. Reconcile even on failure,
+	// and fail closed if its size cannot be established.
+	if err != nil || q.pending[hash] >= 32 {
+		return errors.Join(err, s.reconcile(hash))
 	}
-	return errors.Join(err, sizeErr)
+	return nil
+}
+
+// reconcile requires the quota lock. It releases unused reservations only after
+// obtaining an exact count, including staged and retained ciphertext.
+func (s *Collection) reconcile(hash string) error {
+	size, sizeErr := s.backend.Usage(context.Background(), hash)
+	if sizeErr != nil {
+		s.quota.accountError = sizeErr
+		return sizeErr
+	}
+	s.quota.sizes[hash] = size.Bytes
+	delete(s.quota.pending, hash)
+	return nil
 }
 
 func directoryBytes(dir string) (int64, error) {
@@ -297,14 +317,10 @@ func (t *encryptedTorrent) transfer(buffer []byte, offset int64, write bool) (in
 		amount := min(int64(len(buffer)), end-offset)
 		name := "site/" + strings.Join(file.BestPath(), "/")
 		if write {
-			// Gaps are encrypted zeros, so reserve their actual extent too.
-			var length int64
-			if stat, statErr := store.Stat(name); statErr == nil {
-				length = stat.Size()
-			} else if !errors.Is(statErr, fs.ErrNotExist) {
-				return done, statErr
-			}
-			growth := 2*(max(int64(storeChunkSize), local+amount-length)+int64(storeChunkSize)) + 64<<10
+			// Sparse gaps allocate no payload. Reserve staging, committed chunks,
+			// and metadata only for the chunks touched by this write.
+			chunks := (local%storeChunkSize + amount + storeChunkSize - 1) / storeChunkSize
+			growth := 2*chunks*(storeChunkSize+256) + 64<<10
 			err = s.mutate(t.hash, growth, func() error {
 				if err := store.MkdirAll(path.Dir(name)); err != nil {
 					return err

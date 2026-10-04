@@ -71,6 +71,8 @@ type Transport struct {
 	transfers         map[string]*Transfer
 	maxBytes          int64
 	openGate          chan struct{}
+	peerWake          chan struct{}
+	peerErr           error
 	closed            bool
 	seeding           bool
 	done              <-chan struct{}
@@ -114,6 +116,12 @@ func New(ctx context.Context, stores *storage.Collection, opts ...Option) (*Tran
 	}
 	lifetime, cancel := context.WithCancel(ctx)
 	t := &Transport{client: client, stores: stores, transfers: make(map[string]*Transfer), maxBytes: o.maxBytes, done: lifetime.Done(), cancel: cancel, openGate: make(chan struct{}, 1), discovery: o.discovery}
+	t.peerWake = make(chan struct{}, 1)
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		t.maintainPeers(lifetime)
+	}()
 	for _, server := range client.DhtServers() {
 		if wrapped, ok := server.(torrent.AnacrolixDhtServerWrapper); ok {
 			t.dht = wrapped.Server
@@ -248,6 +256,7 @@ func (t *Transport) Open(ctx context.Context, hash string, validate func(content
 	}
 	t.transfers[hash] = transfer
 	torrentHandle.VerifyData()
+	t.wakePeers()
 	return transfer, nil
 }
 
@@ -413,5 +422,6 @@ func (t *Transport) Drop(ctx context.Context, hash string) error {
 	transfer.mu.Unlock()
 	transfer.torrent.Drop()
 	delete(t.transfers, hash)
+	t.wakePeers()
 	return nil
 }

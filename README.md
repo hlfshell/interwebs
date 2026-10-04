@@ -19,5 +19,6 @@ being updated. Start with [the core README](interwebs/README.md),
 [the review checkpoint](interwebs/REVIEW.md), and [the checklist](TODO.md).
 The first shared application backend now implements profiles, favorites, hosting,
 Live publishing, and retention above the core. Start its review with
-[the application walkthrough](interwebs/app/REVIEW.md). Wails and hosted adapters
-have not been connected to it yet.
+[the application walkthrough](interwebs/app/REVIEW.md). The
+[headless runner](interwebs-hosted/README.md) now consumes that backend with a YAML
+config, CLI, and website serving. Wails has not been connected to it yet.

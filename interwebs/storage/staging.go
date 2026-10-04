@@ -125,6 +125,7 @@ func (w *staging) write(ctx context.Context, name string, input io.Reader, size 
 			u, e := s.backend.Usage(context.Background(), w.id)
 			s.quota.mu.Lock()
 			s.quota.sizes[w.id] = u.Bytes
+			delete(s.quota.pending, w.id)
 			if e != nil {
 				s.quota.accountError = e
 			}
@@ -170,7 +171,11 @@ func (w *staging) write(ctx context.Context, name string, input io.Reader, size 
 		return err
 	}
 	s.mu.Lock()
-	err = s.mutate(w.id, 128<<10, writer.Close)
+	// Committing copies staged ciphertext into permanent chunks before removing
+	// staging. Reserve payload and metadata headroom for that temporary overlap.
+	// Each chunk needs an authentication tag and a new manifest entry.
+	chunks := (size + storeChunkSize - 1) / storeChunkSize
+	err = s.mutate(w.id, size+chunks*256+128<<10, writer.Close)
 	s.mu.Unlock()
 	if err != nil {
 		return err

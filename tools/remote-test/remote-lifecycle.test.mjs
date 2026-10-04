@@ -1,6 +1,16 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {cleanupOnce,finalizeRun,cleanupResources,provisioningGuard} from './remote-lifecycle.mjs';
+import {cleanupDue,cleanupOnce,finalizeRun,cleanupResources,provisioningGuard} from './remote-lifecycle.mjs';
+
+test('retained publishers require explicit cleanup',()=>{
+  const m={keepHostRequested:true,expiresAt:null};
+  assert.equal(cleanupDue(m,{now:1000}),false);
+  assert.equal(cleanupDue({...m,expiresAt:1},{now:1000}),false);
+  assert.equal(cleanupDue(m,{force:true}),true);
+  assert.equal(cleanupDue({...m,cleanedAt:'done'},{force:true}),false);
+  assert.equal(cleanupDue({expiresAt:999},{now:1000}),true);
+  assert.equal(cleanupDue({expiresAt:1001},{now:1000}),false);
+});
 
 test('log failure cannot prevent cleanup',async()=>{
   let cleaned=false;
@@ -27,6 +37,14 @@ test('one API failure does not skip other resources or mark cleanup complete',as
 });
 test('key-only provisioning failure is cleaned safely',async()=>{
   const e=environment({tagOnly:true});await cleanupResources(e.m,e.deps);assert.deepEqual(e.deleted,['3','test-run']);
+});
+test('key deletion verification tolerates an eventually consistent list',async()=>{
+  const e=environment({tagOnly:true});const original=e.deps.doctl;let keyReads=0;
+  e.deps.doctl=async(...args)=>{
+    if(args[1]==='ssh-key'&&++keyReads===2)return [{id:3,name:'test-run'}];
+    return original(...args);
+  };
+  await cleanupResources(e.m,e.deps);assert.ok(e.m.cleanedAt);assert.equal(keyReads,3);
 });
 test('both diagnostics and cleanup failures are reported',async()=>{
   await assert.rejects(finalizeRun(async()=>{throw Error('log');},async()=>{throw Error('cleanup');}),e=>e.errors.length===2);

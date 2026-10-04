@@ -14,3 +14,12 @@ frontend/playwright-report/
 # Keep working notes local; publish only README Markdown files.
 *.[mM][dD]
 !README.md
+
+# Default headless runtime state and operator configuration.
+/data/
+/interweb.yaml
+/interwebs-hosted/data/
+/interwebs-hosted/interweb.yaml
+
+# Local sample sites, their runner configs, and encrypted test state.
+/test_sites/

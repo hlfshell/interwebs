@@ -108,10 +108,17 @@ type Result struct {
 
 type config struct {
 	offline                        bool
+	startPaused                    bool
 	maxSiteBytes, nodeStorageLimit int64
 }
 
 type Option func(*config) error
+
+// WithPausedStart suspends restored and new profiles before workers start, allowing
+// an operator to reconcile configuration before explicitly calling Resume.
+func WithPausedStart(value bool) Option {
+	return func(c *config) error { c.startPaused = value; return nil }
+}
 
 // WithOffline disables public discovery; explicit local operations still work.
 func WithOffline(value bool) Option {

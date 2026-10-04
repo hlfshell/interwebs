@@ -35,6 +35,8 @@ type Status struct {
 	RefreshError        string
 	PersistenceError    string
 	AnnouncementError   string
+	// PeerAnnouncementError is separate from signed-record publication errors.
+	PeerAnnouncementError string
 	// MappingError reports nonfatal NAT discovery, mapping, or cleanup failures.
 	MappingError string
 	Capabilities Capabilities
@@ -62,7 +64,7 @@ func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	s := n.state
-	out := Status{MappingError: errorText(n.transport.MappingError()), AnnouncedSequence: n.announcedSequence, Name: s.Name, Magnet: s.Identity.Magnet(), Identity: s.Identity,
+	out := Status{PeerAnnouncementError: errorText(n.transport.PeerAnnouncementError()), MappingError: errorText(n.transport.MappingError()), AnnouncedSequence: n.announcedSequence, Name: s.Name, Magnet: s.Identity.Magnet(), Identity: s.Identity,
 		Record: s.Record.Clone(), Current: s.Current, Discovered: s.Record.Hash,
 		History: make([]identity.Record, len(s.History)), Availability: Unresolved,
 		Seeding: n.seeding, Capabilities: n.capabilities(), DownloadError: n.lastError,

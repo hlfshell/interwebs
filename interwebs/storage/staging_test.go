@@ -75,6 +75,10 @@ func TestStagingAtomicFailureLeasesAndCapacity(t *testing.T) {
 	if err := w.write(t.Context(), "test", bytes.NewReader(make([]byte, 3<<20)), 3<<20); !errors.Is(err, ErrBufferFull) {
 		t.Fatal(err)
 	}
+	// The staged bytes alone fit, but staging plus committed chunks do not.
+	if err := w.write(t.Context(), "test", bytes.NewReader(make([]byte, 1536<<10)), 1536<<10); !errors.Is(err, ErrBufferFull) {
+		t.Fatal("commit overlap exceeded capacity", err)
+	}
 	r, err := w.read(t.Context(), "test")
 	if err != nil {
 		t.Fatal(err)

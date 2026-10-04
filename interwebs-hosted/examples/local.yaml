@@ -1,0 +1,11 @@
+# Paths resolve relative to this file.
+data_dir: ../data
+source_roots: [./site]
+max_site_mib: 512
+node_storage_mib: 2048
+sites:
+  - name: hello
+    folder: ./site
+    live: false
+    serve:
+      listen: 127.0.0.1:8080

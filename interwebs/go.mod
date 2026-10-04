@@ -6,7 +6,7 @@ require (
 	github.com/anacrolix/dht/v2 v2.23.0
 	github.com/anacrolix/torrent v1.61.0
 	github.com/gofrs/flock v0.12.1
-	github.com/hlfshell/sandboxed v0.0.0-20260914025950-143580983fdc
+	github.com/hlfshell/sandboxed v0.0.0-20261004173353-d8020dcfc73d
 	github.com/jackpal/gateway v1.2.0
 	github.com/jackpal/go-nat-pmp v1.1.0
 )

@@ -7,7 +7,7 @@ import {resolve, join, dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {createInterface} from 'node:readline';
-import {cleanupOnce,finalizeRun,cleanupResources,provisioningGuard} from './remote-lifecycle.mjs';
+import {cleanupDue,cleanupOnce,finalizeRun,cleanupResources,provisioningGuard} from './remote-lifecycle.mjs';
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -21,23 +21,25 @@ async function cleanup(m) {
   console.log(`Cleaning ${m.tag}`);
   await cleanupResources(m,{doctl,command,pause,save,log:console.log});
 }
+const known=new Set();
 for(const entry of await readdir(runs,{withFileTypes:true})) {
   if(!entry.isDirectory()||!/^interweb-test-[0-9]+-[a-f0-9-]+$/.test(entry.name))continue;
   const m=JSON.parse(await readFile(join(runs,entry.name,'manifest.json'),'utf8'));
   if(m.tag!==entry.name)throw Error('Invalid resource manifest');
-  if(!m.cleanedAt && (Date.now()>m.expiresAt || process.argv.includes('--cleanup-current')))await cleanup(m);
+  known.add(m.tag);
+  if(cleanupDue(m,{force:process.argv.includes('--cleanup-current')}))await cleanup(m);
 }
 // Discover orphaned tagged droplets even if a previous process lost its manifest.
 for(const d of await doctl('compute','droplet','list')) {
   const tag=d.tags?.find(t=>/^interweb-test-[0-9]+-[a-f0-9-]+$/.test(t));
-  if(tag && Date.now()>Number(tag.split('-')[2])+30*60*1000) {
+  if(tag && !known.has(tag) && Date.now()>Number(tag.split('-')[2])+30*60*1000) {
     await mkdir(join(runs,tag),{recursive:true,mode:0o700});
     await cleanup({tag,expiresAt:0,reconciled:true});
   }
 }
 for(const item of [...await doctl('compute','tag','list'),...await doctl('compute','ssh-key','list')]) {
   const tag=item.name;
-  if(/^interweb-test-[0-9]+-[a-f0-9-]+$/.test(tag) && Date.now()>Number(tag.split('-')[2])+30*60*1000) {
+  if(!known.has(tag) && /^interweb-test-[0-9]+-[a-f0-9-]+$/.test(tag) && Date.now()>Number(tag.split('-')[2])+30*60*1000) {
     await mkdir(join(runs,tag),{recursive:true,mode:0o700});await cleanup({tag,expiresAt:0,reconciled:true});
   }
 }

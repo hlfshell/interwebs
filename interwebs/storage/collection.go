@@ -150,6 +150,8 @@ func (v *Version) Close() error {
 	return nil
 }
 
+// Open returns a verified reader with a one-piece plaintext cache (at most
+// 4 MiB). Sequential reads reuse authenticated bytes; Seek discards the cache.
 func (v *Version) Open(ctx context.Context, name string) (content.Reader, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -200,6 +202,8 @@ type verifiedReader struct {
 	contextErr             func() error
 	once                   sync.Once
 	closed                 bool
+	buffer                 []byte
+	bufferIndex            int
 }
 
 func (r *verifiedReader) Read(p []byte) (int, error) {
@@ -220,17 +224,31 @@ func (r *verifiedReader) Read(p []byte) (int, error) {
 	absolute := r.offset + r.position
 	index := int(absolute / r.info.PieceLength)
 	piece := r.info.Piece(index)
-	buffer := make([]byte, piece.Length())
-	if _, err := r.torrent.transfer(buffer, piece.Offset(), false); err != nil {
-		return 0, err
+	if r.buffer != nil && r.bufferIndex == index {
+		r.torrent.storage.mu.Lock()
+		closed := r.torrent.storage.closed
+		r.torrent.storage.mu.Unlock()
+		if closed {
+			return 0, fs.ErrClosed
+		}
 	}
-	sum := sha1.Sum(buffer)
-	if !bytes.Equal(sum[:], r.info.Pieces[index*20:(index+1)*20]) {
-		return 0, errors.New("stored piece hash mismatch")
+	if r.buffer == nil || r.bufferIndex != index {
+		// Keep at most one authenticated piece for small sequential reads.
+		// Do not retain partially read or unverified data after an error.
+		r.buffer = nil
+		buffer := make([]byte, piece.Length())
+		if _, err := r.torrent.transfer(buffer, piece.Offset(), false); err != nil {
+			return 0, err
+		}
+		sum := sha1.Sum(buffer)
+		if !bytes.Equal(sum[:], r.info.Pieces[index*20:(index+1)*20]) {
+			return 0, errors.New("stored piece hash mismatch")
+		}
+		r.buffer, r.bufferIndex = buffer, index
 	}
 	within := absolute - piece.Offset()
-	count := min(int64(len(p)), min(int64(len(buffer))-within, r.size-r.position))
-	copy(p, buffer[within:within+count])
+	count := min(int64(len(p)), min(int64(len(r.buffer))-within, r.size-r.position))
+	copy(p, r.buffer[within:within+count])
 	r.position += count
 	return int(count), nil
 }
@@ -257,9 +275,10 @@ func (r *verifiedReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.New("seek outside content")
 	}
 	r.position = base + offset
+	r.buffer = nil
 	return r.position, nil
 }
 func (r *verifiedReader) Close() error {
-	r.once.Do(func() { r.closed = true; r.torrent.storage.release(r.torrent.hash) })
+	r.once.Do(func() { r.closed = true; r.buffer = nil; r.torrent.storage.release(r.torrent.hash) })
 	return nil
 }

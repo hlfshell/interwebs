@@ -15,6 +15,8 @@ import (
 
 // Backend owns isolated, authenticated version stores. Collection serializes
 // mutations. Implementations must account for temporary and retained ciphertext.
+// Growth must bound the peak additional bytes of a mutation, including metadata.
+// Stores owned by a Collection must not be mutated outside that Collection.
 // Open with create=false must never create content. Close is idempotent.
 type Backend interface {
 	Open(context.Context, string, bool) (Store, error)
@@ -27,6 +29,7 @@ type Backend interface {
 
 // Store exposes virtual paths, not host paths or an underlying sandboxed handle.
 // Returned readers must support Seek. Updates commit atomically on Close.
+// Writes beyond EOF must leave gaps unallocated; Stat reports logical size.
 type Store interface {
 	Open(string) (fs.File, error)
 	Stat(string) (fs.FileInfo, error)
@@ -138,14 +141,25 @@ func (b *Sandboxed) List(ctx context.Context) ([]Usage, error) {
 
 // Growth takes a conservative payload/staging bound from the mutation adapter.
 func (b *Sandboxed) Growth(ctx context.Context, hash string, bound int64) (int64, error) {
-	u, err := b.Usage(ctx, hash)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if !validStoreHash(hash) {
+		return 0, errors.New("invalid store hash")
+	}
+	// Reservations need only the manifest size, not a walk of every chunk.
+	stat, err := os.Stat(filepath.Join(b.dir, hash, "manifest"))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return 0, err
 	}
-	if bound < 0 || u.MetadataBytes > (math.MaxInt64-bound)/2 {
+	var metadata int64
+	if err == nil {
+		metadata = stat.Size()
+	}
+	if bound < 0 || metadata > (math.MaxInt64-bound)/2 {
 		return 0, errors.New("storage reservation overflow")
 	}
-	return bound + 2*u.MetadataBytes, nil
+	return bound + 2*metadata, nil
 }
 
 func (b *Sandboxed) Remove(ctx context.Context, hash string) error {

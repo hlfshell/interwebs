@@ -1,4 +1,11 @@
 // Share one cleanup promise across normal completion, timeouts and signals.
+export function cleanupDue(manifest, {now=Date.now(), force=false}={}) {
+  if(manifest.cleanedAt)return false;
+  if(force)return true;
+  if(manifest.keepHostRequested)return false;
+  return typeof manifest.expiresAt==='number'&&now>manifest.expiresAt;
+}
+
 export function cleanupOnce(cleanup) {
   let pending;
   return () => pending ??= Promise.resolve().then(cleanup);
@@ -43,8 +50,12 @@ export async function cleanupResources(m,{doctl,command,pause,save,log=()=>{}}) 
   const keys=await attempt(()=>doctl('compute','ssh-key','list'));
   for(const key of keys??[]) if(key.name===m.tag)await attempt(()=>command('doctl',['compute','ssh-key','delete',String(key.id),'--force']));
   await attempt(async()=>{
-    const left=(await doctl('compute','ssh-key','list')).filter(k=>k.name===m.tag);
-    if(left.length)throw Error(`SSH keys remain: ${left.map(k=>k.id).join(', ')}`);
+    for(let n=0;n<12;n++) {
+      const left=(await doctl('compute','ssh-key','list')).filter(k=>k.name===m.tag);
+      if(!left.length)return;
+      if(n===11)throw Error(`SSH keys remain: ${left.map(k=>k.id).join(', ')}`);
+      await pause(5000);
+    }
   });
   // Keep the discovery tag while any deletion is uncertain, for later recovery.
   if(errors.length){m.cleanupErrors=errors.map(e=>e.message);await attempt(()=>save(m));throw new AggregateError(errors,`Cleanup incomplete for ${m.tag}`);}
