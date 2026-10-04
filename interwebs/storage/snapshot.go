@@ -32,8 +32,12 @@ func (s *Collection) Snapshot(ctx context.Context, source content.Source) (manif
 	if err != nil {
 		return manifest, err
 	}
+	installed := false
 	defer func() {
 		stage.close()
+		if installed {
+			return
+		}
 		err := s.Remove(context.Background(), stage.id)
 		if err != nil {
 			s.quota.mu.Lock()
@@ -43,6 +47,7 @@ func (s *Collection) Snapshot(ctx context.Context, source content.Source) (manif
 		resultErr = errors.Join(resultErr, err)
 	}()
 	info := metainfo.Info{Name: "site", PieceLength: 256 << 10}
+	pieces := newPieceHashes(int(info.PieceLength))
 	var total int64
 	for _, f := range files {
 		if err := content.ValidatePath(f.Path); err != nil {
@@ -56,7 +61,8 @@ func (s *Collection) Snapshot(ctx context.Context, source content.Source) (manif
 		if err != nil {
 			return manifest, err
 		}
-		err = stage.write(ctx, "site/"+f.Path, r, f.Size)
+		// Hash the exact bytes being encrypted, without a second staged read.
+		err = stage.write(ctx, "site/"+f.Path, io.TeeReader(r, pieces), f.Size)
 		err = errors.Join(err, r.Close())
 		if err != nil {
 			return manifest, err
@@ -70,11 +76,7 @@ func (s *Collection) Snapshot(ctx context.Context, source content.Source) (manif
 	if before != after {
 		return manifest, errors.New("source changed while snapshotting")
 	}
-	if err := info.GeneratePieces(func(f metainfo.FileInfo) (io.ReadCloser, error) {
-		return stage.read(ctx, "site/"+strings.Join(f.Path, "/"))
-	}); err != nil {
-		return manifest, err
-	}
+	info.Pieces = pieces.sum()
 	encoded, err := bencode.Marshal(info)
 	if err != nil {
 		return manifest, err
@@ -106,6 +108,10 @@ func (s *Collection) Snapshot(ctx context.Context, source content.Source) (manif
 		if complete {
 			return manifest, nil
 		}
+	}
+	installed, err = s.install(ctx, stage, manifest.Hash(), encoded)
+	if err != nil || installed {
+		return manifest, err
 	}
 	s.mu.Lock()
 	_, err = s.open(manifest.Hash())

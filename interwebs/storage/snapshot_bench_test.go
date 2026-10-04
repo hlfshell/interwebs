@@ -18,6 +18,10 @@ type measuredBackend struct {
 	calls      int
 }
 
+func (b *measuredBackend) Install(ctx context.Context, from, to string) error {
+	return b.Backend.(Installer).Install(ctx, from, to)
+}
+
 func (b *measuredBackend) Usage(ctx context.Context, hash string) (Usage, error) {
 	start := time.Now()
 	usage, err := b.Backend.Usage(ctx, hash)

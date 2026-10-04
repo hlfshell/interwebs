@@ -7,6 +7,8 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -223,5 +225,63 @@ func TestEncryptedWritesRemainConservativelyAccounted(t *testing.T) {
 		if s.quota.sizes[hash] < u.Bytes {
 			t.Fatalf("write %d: reserved %d, actual %d", i, s.quota.sizes[hash], u.Bytes)
 		}
+	}
+}
+
+func TestWALMetadataAndCheckpointHeadroomAreAccounted(t *testing.T) {
+	s := testCollection(t)
+	b := s.backend.(*Sandboxed)
+	hash := strings.Repeat("b", 40)
+	s.mu.Lock()
+	store, err := s.open(hash)
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	err = s.mutate(hash, 256<<10, func() error { return store.WriteFile("private-name", bytes.NewReader([]byte("private-payload"))) })
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.quota.mu.Lock()
+	err = s.reconcile(hash)
+	reserved := s.quota.sizes[hash]
+	s.quota.mu.Unlock()
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(b.dir, hash)
+	manifest, err := os.Stat(filepath.Join(dir, "manifest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal, err := os.ReadFile(filepath.Join(dir, "wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wal) == 0 || bytes.Contains(wal, []byte("private-name")) || bytes.Contains(wal, []byte("private-payload")) {
+		t.Fatal("WAL missing or unencrypted")
+	}
+	u, err := b.Usage(t.Context(), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.MetadataBytes != manifest.Size()+int64(len(wal)) {
+		t.Fatal("WAL missing from metadata accounting", u)
+	}
+	if reserved < u.Bytes+2*u.MetadataBytes {
+		t.Fatal("reconciliation discarded checkpoint headroom", reserved, u)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	u, err = b.Usage(t.Context(), hash)
+	if err != nil || u.Bytes > reserved {
+		t.Fatal("checkpoint exceeded reservation", u, reserved, err)
+	}
+	wal, err = os.ReadFile(filepath.Join(dir, "wal"))
+	if err != nil || len(wal) != 0 {
+		t.Fatal("close did not retire WAL", err)
 	}
 }

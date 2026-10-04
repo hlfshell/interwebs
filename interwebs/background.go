@@ -50,13 +50,10 @@ func (n *Node) maintain(ctx context.Context, interval time.Duration, offline boo
 }
 
 func (n *Node) announce(ctx context.Context) (int64, error) {
-	ctx, release, err := n.operation(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer release()
+	// maintain owns this work's lifetime and Close waits for it. Announcing a
+	// durable record must not wait behind a download or an in-progress snapshot.
 	n.mu.Lock()
-	enabled, record, address, persistErr := n.seeding, n.state.Record.Clone(), n.state.Identity, n.persistenceErr
+	enabled, record, address, persistErr := n.seeding, n.durableRecord.Clone(), n.state.Identity, n.persistenceErr
 	n.mu.Unlock()
 	if !enabled {
 		return 0, nil
@@ -67,7 +64,7 @@ func (n *Node) announce(ctx context.Context) (int64, error) {
 	if record.Hash == "" || address.Key == "" {
 		return 0, nil
 	}
-	err = n.transport.Announce(ctx, address, record)
+	err := n.transport.Announce(ctx, address, record)
 	return record.Sequence, err
 }
 

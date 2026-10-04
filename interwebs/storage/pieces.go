@@ -11,8 +11,8 @@ import (
 	"io/fs"
 	"math"
 	"os"
-	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +37,7 @@ type Collection struct {
 	backend  Backend
 	leases   map[string]int
 	closeErr error
+	receive  *receiver
 }
 
 func validStoreHash(hash string) bool {
@@ -169,7 +170,17 @@ func (s *Collection) reconcile(hash string) error {
 		s.quota.accountError = sizeErr
 		return sizeErr
 	}
-	s.quota.sizes[hash] = size.Bytes
+	// Preserve checkpoint headroom even after releasing unused write reserves:
+	// sandboxed Close can checkpoint a WAL after the last payload mutation.
+	headroom, err := s.backend.Growth(context.Background(), hash, 0)
+	if err != nil || headroom < 0 || size.Bytes > math.MaxInt64-headroom {
+		if err == nil {
+			err = errors.New("invalid storage checkpoint reservation")
+		}
+		s.quota.accountError = err
+		return err
+	}
+	s.quota.sizes[hash] = size.Bytes + headroom
 	delete(s.quota.pending, hash)
 	return nil
 }
@@ -177,6 +188,12 @@ func (s *Collection) reconcile(hash string) error {
 func directoryBytes(dir string) (int64, error) {
 	var size int64
 	err := filepath.WalkDir(dir, func(name string, entry fs.DirEntry, err error) error {
+		// The store's deferred garbage collector can unlink obsolete chunks
+		// while we scan. Missing children contribute no bytes; other failures
+		// (including a missing store root) must still fail closed.
+		if name != dir && errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -187,6 +204,9 @@ func directoryBytes(dir string) (int64, error) {
 			return nil
 		}
 		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -225,6 +245,8 @@ func (s *Collection) remove(hash string) error {
 }
 
 func (s *Collection) Close() error {
+	// Drain accepted downloads before closing the stores they target.
+	receiveErr := s.receive.close()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -239,15 +261,45 @@ func (s *Collection) Close() error {
 		}
 		delete(s.stores, hash)
 	}
-	s.closeErr = errors.Join(append(errs, s.backend.Close())...)
+	s.closeErr = errors.Join(append(errs, receiveErr, s.backend.Close())...)
 	return s.closeErr
 }
 
 type encryptedTorrent struct {
+	mu       sync.RWMutex
+	closed   bool
 	storage  *Collection
 	hash     string
-	files    []metainfo.FileInfo
+	files    []torrentFile
 	complete sync.Map
+}
+
+type torrentFile struct {
+	name       string
+	start, end int64
+}
+
+// torrentFiles builds the immutable layout once, rather than walking metadata
+// and rebuilding paths for every incoming block and verification read.
+func torrentFiles(info *metainfo.Info) []torrentFile {
+	files := info.UpvertedFiles()
+	layout := make([]torrentFile, 0, len(files))
+	var offset int64
+	for _, file := range files {
+		name := strings.Join(file.BestPath(), "/")
+		if len(info.Files) == 0 {
+			name = info.BestName()
+		}
+		if file.Length > 0 {
+			layout = append(layout, torrentFile{name: "site/" + name, start: offset, end: offset + file.Length})
+		}
+		offset += file.Length
+	}
+	return layout
+}
+
+func (t *encryptedTorrent) fileAt(offset int64) int {
+	return sort.Search(len(t.files), func(i int) bool { return t.files[i].end > offset })
 }
 
 type encryptedPiece struct {
@@ -255,6 +307,11 @@ type encryptedPiece struct {
 	piece   metainfo.Piece
 }
 
+// OpenTorrent adapts a validated manifest to torrent piece storage. Writes copy
+// into a bounded asynchronous queue; reads, MarkComplete and Close wait for prior
+// writes to commit. A crash can lose queued, unverified blocks (downloaded again
+// on restart). Async failures surface on subsequent I/O and Close; reopen the
+// collection to retry after fixing the underlying storage failure.
 func (s *Collection) OpenTorrent(ctx context.Context, info *metainfo.Info, hash metainfo.Hash) (torrentstorage.TorrentImpl, error) {
 	if err := ctx.Err(); err != nil {
 		return torrentstorage.TorrentImpl{}, err
@@ -278,11 +335,7 @@ func (s *Collection) OpenTorrent(ctx context.Context, info *metainfo.Info, hash 
 	if err := s.putInfo(hash.HexString(), encoded); err != nil {
 		return torrentstorage.TorrentImpl{}, err
 	}
-	files := info.UpvertedFiles()
-	if len(info.Files) == 0 {
-		files[0].Path = []string{info.BestName()}
-	}
-	t := &encryptedTorrent{storage: s, hash: hash.HexString(), files: files}
+	t := &encryptedTorrent{storage: s, hash: hash.HexString(), files: torrentFiles(info)}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -291,63 +344,56 @@ func (s *Collection) OpenTorrent(ctx context.Context, info *metainfo.Info, hash 
 	s.leases[t.hash]++
 	s.mu.Unlock()
 	var once sync.Once
+	var closeErr error
 	return torrentstorage.TorrentImpl{Piece: func(p metainfo.Piece) torrentstorage.PieceImpl { return encryptedPiece{t, p} }, Close: func() error {
-		once.Do(func() { s.mu.Lock(); s.leases[t.hash]--; s.mu.Unlock() })
-		return nil
+		once.Do(func() {
+			t.mu.Lock()
+			t.closed = true
+			t.mu.Unlock()
+			closeErr = s.receive.flush()
+			if errors.Is(closeErr, fs.ErrClosed) {
+				// Collection shutdown owns the drain now. Do not release this
+				// store's lease or lose a late commit error before it finishes.
+				<-s.receive.done
+				closeErr = s.receive.failure()
+			}
+			s.mu.Lock()
+			s.leases[t.hash]--
+			s.mu.Unlock()
+		})
+		return closeErr
 	}}, nil
 }
 
-func (t *encryptedTorrent) transfer(buffer []byte, offset int64, write bool) (int, error) {
+func (t *encryptedTorrent) readAt(buffer []byte, offset int64) (int, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed {
+		return 0, fs.ErrClosed
+	}
 	s := t.storage
+	if err := s.receive.flush(); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	store, err := s.open(t.hash)
 	if err != nil {
 		return 0, err
 	}
-	var start int64
 	var done int
-	for _, file := range t.files {
-		end := start + file.Length
-		if offset >= end {
-			start = end
-			continue
-		}
-		local := offset - start
-		amount := min(int64(len(buffer)), end-offset)
-		name := "site/" + strings.Join(file.BestPath(), "/")
-		if write {
-			// Sparse gaps allocate no payload. Reserve staging, committed chunks,
-			// and metadata only for the chunks touched by this write.
-			chunks := (local%storeChunkSize + amount + storeChunkSize - 1) / storeChunkSize
-			growth := 2*chunks*(storeChunkSize+256) + 64<<10
-			err = s.mutate(t.hash, growth, func() error {
-				if err := store.MkdirAll(path.Dir(name)); err != nil {
-					return err
-				}
-				f, err := store.Update(name)
-				if errors.Is(err, fs.ErrNotExist) {
-					f, err = store.Create(name)
-				}
-				if err != nil {
-					return err
-				}
-				defer f.Abort()
-				if _, err = f.WriteAt(buffer[:amount], local); err != nil {
-					return err
-				}
-				return f.Close()
-			})
-		} else {
-			var f fs.File
-			f, err = store.Open(name)
+	for _, file := range t.files[t.fileAt(offset):] {
+		local := offset - file.start
+		amount := min(int64(len(buffer)), file.end-offset)
+		name := file.name
+		var f fs.File
+		f, err = store.Open(name)
+		if err == nil {
+			_, err = f.(io.Seeker).Seek(local, io.SeekStart)
 			if err == nil {
-				_, err = f.(io.Seeker).Seek(local, io.SeekStart)
-				if err == nil {
-					_, err = io.ReadFull(f, buffer[:amount])
-				}
-				err = errors.Join(err, f.Close())
+				_, err = io.ReadFull(f, buffer[:amount])
 			}
+			err = errors.Join(err, f.Close())
 		}
 		if err != nil {
 			return done, err
@@ -355,7 +401,6 @@ func (t *encryptedTorrent) transfer(buffer []byte, offset int64, write bool) (in
 		done += int(amount)
 		offset += amount
 		buffer = buffer[amount:]
-		start = end
 		if len(buffer) == 0 {
 			return done, nil
 		}
@@ -370,7 +415,7 @@ func (p encryptedPiece) ReadAt(b []byte, off int64) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	return p.torrent.transfer(b, p.piece.Offset()+off, false)
+	return p.torrent.readAt(b, p.piece.Offset()+off)
 }
 func (p encryptedPiece) WriteAt(b []byte, off int64) (int, error) {
 	if off < 0 || off > p.piece.Length() || int64(len(b)) > p.piece.Length()-off {
@@ -379,9 +424,24 @@ func (p encryptedPiece) WriteAt(b []byte, off int64) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	return p.torrent.transfer(b, p.piece.Offset()+off, true)
+	t := p.torrent
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed {
+		return 0, fs.ErrClosed
+	}
+	t.complete.Delete(p.piece.Index())
+	return t.storage.receive.write(t, b, p.piece.Offset()+off)
 }
 func (p encryptedPiece) MarkComplete() error {
+	p.torrent.mu.Lock()
+	defer p.torrent.mu.Unlock()
+	if p.torrent.closed {
+		return fs.ErrClosed
+	}
+	if err := p.torrent.storage.receive.flush(); err != nil {
+		return err
+	}
 	p.torrent.complete.Store(p.piece.Index(), true)
 	return nil
 }
@@ -390,6 +450,9 @@ func (p encryptedPiece) MarkNotComplete() error {
 	return nil
 }
 func (p encryptedPiece) Completion() torrentstorage.Completion {
+	if p.torrent.storage.receive.failure() != nil {
+		return torrentstorage.Completion{Ok: false}
+	}
 	_, ok := p.torrent.complete.Load(p.piece.Index())
 	return torrentstorage.Completion{Ok: true, Complete: ok}
 }

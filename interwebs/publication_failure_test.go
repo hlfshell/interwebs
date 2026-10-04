@@ -27,8 +27,14 @@ func (d *durableAnnouncements) Announce(_ context.Context, _ identity.Identity, 
 	if err == nil {
 		err = json.Unmarshal(encoded, &state)
 	}
-	if err == nil && (state.Record.Sequence != record.Sequence || state.Record.Hash != record.Hash) {
-		err = errors.New("announced a non-durable version")
+	if err == nil {
+		found := state.Record.Sequence == record.Sequence && state.Record.Hash == record.Hash
+		for _, saved := range state.History {
+			found = found || saved.Sequence == record.Sequence && saved.Hash == record.Hash
+		}
+		if !found {
+			err = errors.New("announced a non-durable version")
+		}
 	}
 	if err != nil {
 		d.invalid <- err
@@ -58,15 +64,21 @@ func TestNewPublicationAnnouncesWithoutWaitingForRepublishInterval(t *testing.T)
 		if _, err := n.Publish(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		select {
-		case err := <-discovery.invalid:
-			t.Fatal(err)
-		case record := <-discovery.sent:
-			if record.Sequence != int64(sequence+1) {
-				t.Fatal(record)
+		timeout := time.After(2 * time.Second)
+		for announced := false; !announced; {
+			select {
+			case err := <-discovery.invalid:
+				t.Fatal(err)
+			case record := <-discovery.sent:
+				// The durable prior version can renew while its replacement is
+				// still being snapshotted. The new version must follow promptly.
+				if record.Sequence > int64(sequence+1) {
+					t.Fatal(record)
+				}
+				announced = record.Sequence == int64(sequence+1)
+			case <-timeout:
+				t.Fatal("new version waited for periodic re-announcement")
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("new version waited for periodic re-announcement")
 		}
 		deadline := time.Now().Add(time.Second)
 		for n.Status().AnnouncedSequence < int64(sequence+1) && time.Now().Before(deadline) {
@@ -100,6 +112,12 @@ func TestPublicationRetryPersistsSameVersionAfterSaveFailure(t *testing.T) {
 	failed := n.Status().Record
 	if n.Status().PersistenceError == "" {
 		t.Fatal("unsaved state was hidden from status")
+	}
+	n.mu.Lock()
+	durable := n.durableRecord.Clone()
+	n.mu.Unlock()
+	if durable.Hash != "" {
+		t.Fatal("failed publication became eligible for announcement")
 	}
 	if failed.Sequence != 1 {
 		t.Fatalf("expected prepared version: %+v", failed)

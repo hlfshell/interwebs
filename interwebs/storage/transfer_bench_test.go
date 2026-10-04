@@ -52,6 +52,9 @@ func BenchmarkTorrentWrites(b *testing.B) {
 						b.Fatalf("write: %d, %v", n, err)
 					}
 				}
+				if err := collection.receive.flush(); err != nil {
+					b.Fatal(err)
+				}
 				elapsed += time.Since(start)
 				accounting += measured.accounting
 				b.StopTimer()
@@ -108,6 +111,9 @@ func BenchmarkSparseTailWrite(b *testing.B) {
 				b.StartTimer()
 				if n, err := piece.WriteAt(payload, pieceSize-block); err != nil || n != block {
 					b.Fatalf("tail write: %d, %v", n, err)
+				}
+				if err := collection.receive.flush(); err != nil {
+					b.Fatal(err)
 				}
 				b.StopTimer()
 				usage, err := backend.Usage(b.Context(), metainfo.Hash(hash).HexString())

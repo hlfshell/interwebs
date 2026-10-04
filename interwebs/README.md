@@ -94,7 +94,19 @@ The default content maximum is 512 MiB per version (`WithMaxSiteBytes`).
 `WithStorageLimit` caps physical encrypted bytes including retained versions and staging,
 defaulting to 2 GiB. Neither limit implies automatic eviction, and neither is saved
 as an application preference. Publication can need space for old, staged,
-and new data simultaneously.
+and new data simultaneously. Metadata accounting includes both sandboxed's
+checkpoint manifest and encrypted WAL. Quota reservations retain checkpoint
+headroom for shutdown, so usable payload space can be lower than the disk budget.
+
+Downloads use a bounded asynchronous receive queue: up to 4 MiB of plaintext
+payload per Node, plus a 256 KiB merge buffer. Writes are batched around 256 KiB;
+partial batches become eligible to flush after 25 ms (disk contention can delay
+completion). Full queues apply backpressure rather than growing memory use.
+Reads and piece verification wait for prior writes to reach encrypted storage;
+normal shutdown drains accepted writes. A crash can lose uncommitted blocks,
+which are downloaded again. An asynchronous storage failure prevents successful
+verification and is returned by subsequent I/O and shutdown; fix the storage
+problem and reopen the Node to retry. Publishing still writes directly to storage.
 
 Publication staging is private: callers use Publish, not a workspace API. Staging
 is encrypted and cleaned up on normal completion or failure; crash/cleanup-failure
@@ -130,3 +142,13 @@ installed executable, and bundled Firefox runs with `steam-run npm test`.
 Applications still need adaptation to this API. No compatibility layer is retained.
 Node state format is version 4; earlier development directories are rejected.
 Cloud resources are not used by these tests.
+
+Receive benchmarks include draining buffered writes to encrypted storage:
+
+```sh
+GOWORK=off go test ./storage -run '^$' -bench 'BenchmarkTorrentWrites/16KiB|BenchmarkReceiveLargeChunks/shuffled=true/64KiB|BenchmarkReceiveVerified' -benchtime=1x -count=3
+```
+
+`BenchmarkReceiveVerified` also reads back, hashes, and completes each piece with
+one or four concurrent simulated peers. These isolate storage performance, not
+public-network throughput; run them without concurrent test/build jobs.

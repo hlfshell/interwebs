@@ -16,6 +16,7 @@ import (
 // Backend owns isolated, authenticated version stores. Collection serializes
 // mutations. Implementations must account for temporary and retained ciphertext.
 // Growth must bound the peak additional bytes of a mutation, including metadata.
+// Collection retains Growth(ctx, hash, 0) headroom for shutdown metadata work.
 // Stores owned by a Collection must not be mutated outside that Collection.
 // Open with create=false must never create content. Close is idempotent.
 type Backend interface {
@@ -25,6 +26,14 @@ type Backend interface {
 	Growth(context.Context, string, int64) (int64, error)
 	Remove(context.Context, string) error
 	Close() error
+}
+
+// Installer optionally installs a closed staging store under an unused version
+// name without copying its payload. ErrExist and context cancellation leave
+// both stores unchanged.
+// Other errors may have an uncertain commit outcome; the collection fails closed.
+type Installer interface {
+	Install(context.Context, string, string) error
 }
 
 // Store exposes virtual paths, not host paths or an underlying sandboxed handle.
@@ -48,7 +57,8 @@ type Writer interface {
 }
 
 type Usage struct {
-	Hash                 string
+	Hash string
+	// MetadataBytes includes the checkpoint manifest and WAL; Bytes includes both.
 	Bytes, MetadataBytes int64
 }
 
@@ -112,12 +122,12 @@ func (b *Sandboxed) Usage(ctx context.Context, hash string) (Usage, error) {
 		return Usage{}, errors.New("invalid store hash")
 	}
 	dir := filepath.Join(b.dir, hash)
-	stat, err := os.Stat(filepath.Join(dir, "manifest"))
+	metadata, err := metadataBytes(dir, false)
 	if err != nil {
 		return Usage{}, err
 	}
 	size, err := directoryBytes(dir)
-	return Usage{Hash: hash, Bytes: size, MetadataBytes: stat.Size()}, err
+	return Usage{Hash: hash, Bytes: size, MetadataBytes: metadata}, err
 }
 
 func (b *Sandboxed) List(ctx context.Context) ([]Usage, error) {
@@ -147,19 +157,35 @@ func (b *Sandboxed) Growth(ctx context.Context, hash string, bound int64) (int64
 	if !validStoreHash(hash) {
 		return 0, errors.New("invalid store hash")
 	}
-	// Reservations need only the manifest size, not a walk of every chunk.
-	stat, err := os.Stat(filepath.Join(b.dir, hash, "manifest"))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	// The checkpoint alone can be stale. Checkpoint plus WAL bounds the live
+	// metadata that a later commit or Close may need to checkpoint. Stat these
+	// two files rather than walking every chunk on each reservation.
+	metadata, err := metadataBytes(filepath.Join(b.dir, hash), true)
+	if err != nil {
 		return 0, err
-	}
-	var metadata int64
-	if err == nil {
-		metadata = stat.Size()
 	}
 	if bound < 0 || metadata > (math.MaxInt64-bound)/2 {
 		return 0, errors.New("storage reservation overflow")
 	}
 	return bound + 2*metadata, nil
+}
+
+func metadataBytes(dir string, allowMissing bool) (int64, error) {
+	var size int64
+	for _, name := range []string{"manifest", "wal"} {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if allowMissing && errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if !info.Mode().IsRegular() || info.Size() > math.MaxInt64-size {
+			return 0, errors.New("invalid storage metadata size or type")
+		}
+		size += info.Size()
+	}
+	return size, nil
 }
 
 func (b *Sandboxed) Remove(ctx context.Context, hash string) error {
@@ -170,6 +196,44 @@ func (b *Sandboxed) Remove(ctx context.Context, hash string) error {
 		return errors.New("invalid store hash")
 	}
 	return os.RemoveAll(filepath.Join(b.dir, hash))
+}
+
+// Install atomically names a closed staging store as a version and syncs the
+// containing directory. The caller must exclusively own both store names.
+func (b *Sandboxed) Install(ctx context.Context, from, to string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return fs.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !validStoreHash(from) || !validStoreHash(to) || from == to {
+		return errors.New("invalid store installation")
+	}
+	source, destination := filepath.Join(b.dir, from), filepath.Join(b.dir, to)
+	if _, err := os.Lstat(destination); err == nil {
+		return fs.ErrExist
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fs.ErrPermission
+	}
+	if err := os.Rename(source, destination); err != nil {
+		return err
+	}
+	// Payloads and their manifest were synced by the store. Persist its new name.
+	dir, err := os.Open(b.dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }
 
 func (b *Sandboxed) Close() error {

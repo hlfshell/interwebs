@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -65,8 +66,16 @@ func New(ctx context.Context, backend Backend, opts ...Option) (*Collection, err
 	s := &Collection{backend: backend, stores: make(map[string]Store), leases: make(map[string]int), limit: &atomic.Int64{}, quota: newQuota(o.storageLimit)}
 	s.limit.Store(o.maxBytes)
 	for _, u := range usage {
-		s.quota.sizes[u.Hash] = u.Bytes
+		headroom, err := backend.Growth(ctx, u.Hash, 0)
+		if err != nil || headroom < 0 || u.Bytes > math.MaxInt64-headroom {
+			if err == nil {
+				err = errors.New("invalid storage checkpoint reservation")
+			}
+			return nil, errors.Join(err, backend.Close())
+		}
+		s.quota.sizes[u.Hash] = u.Bytes + headroom
 	}
+	s.receive = newReceiver()
 	return s, nil
 }
 
@@ -169,10 +178,6 @@ func (v *Version) Open(ctx context.Context, name string) (content.Reader, error)
 	if err := bencode.Unmarshal(v.manifest.Metadata(), &info); err != nil {
 		return nil, err
 	}
-	files := info.UpvertedFiles()
-	if len(info.Files) == 0 {
-		files[0].Path = []string{info.BestName()}
-	}
 	var offset int64
 	for _, f := range v.manifest.Files() {
 		if f.Path == name {
@@ -188,7 +193,7 @@ func (v *Version) Open(ctx context.Context, name string) (content.Reader, error)
 	}
 	s.leases[v.manifest.Hash()]++
 	reader := &verifiedReader{
-		torrent: &encryptedTorrent{storage: s, hash: v.manifest.Hash(), files: files},
+		torrent: &encryptedTorrent{storage: s, hash: v.manifest.Hash(), files: torrentFiles(&info)},
 		info:    info, offset: offset, size: file.Size, done: ctx.Done(), contextErr: ctx.Err,
 	}
 	return content.LimitReader(reader, file.Size), nil
@@ -237,7 +242,7 @@ func (r *verifiedReader) Read(p []byte) (int, error) {
 		// Do not retain partially read or unverified data after an error.
 		r.buffer = nil
 		buffer := make([]byte, piece.Length())
-		if _, err := r.torrent.transfer(buffer, piece.Offset(), false); err != nil {
+		if _, err := r.torrent.readAt(buffer, piece.Offset()); err != nil {
 			return 0, err
 		}
 		sum := sha1.Sum(buffer)

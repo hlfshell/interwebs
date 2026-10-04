@@ -43,6 +43,7 @@ type Node struct {
 	mu                sync.Mutex
 	gate              chan struct{}
 	state             nodeState
+	durableRecord     identity.Record
 	content           content.Content
 	source            content.Source
 	signer            *identity.Signer
@@ -223,6 +224,7 @@ func (n *Node) operation(ctx context.Context) (context.Context, func(), error) {
 func (n *Node) save(ctx context.Context) error {
 	n.mu.Lock()
 	encoded, err := json.MarshalIndent(n.state, "", "  ")
+	record := n.state.Record.Clone()
 	n.mu.Unlock()
 	if err != nil {
 		return err
@@ -230,6 +232,9 @@ func (n *Node) save(ctx context.Context) error {
 	err = n.profile.WriteState(ctx, encoded)
 	n.mu.Lock()
 	n.persistenceErr = err
+	if err == nil {
+		n.durableRecord = record
+	}
 	n.mu.Unlock()
 	return err
 }
