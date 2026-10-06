@@ -20,6 +20,14 @@ func TestStoredSourceRangesAndIsolation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("stored browser content"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	for _, name := range []string{"projects", "talks", "some folder"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, "index.html"), []byte(name+" page"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	source, err := site.New(t.Context(), dir)
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +85,46 @@ func TestStoredSourceRangesAndIsolation(t *testing.T) {
 		}
 		if test.status == 206 && string(body) != "stored" {
 			t.Fatal(string(body))
+		}
+	}
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, test := range []struct {
+		method, path, location string
+		status                 int
+	}{
+		{"GET", "projects", "/projects/", 308},
+		{"HEAD", "talks?year=2026", "/talks/?year=2026", 308},
+		{"GET", "some%20folder?q=a%2Fb", "/some%20folder/?q=a%2Fb", 308},
+		{"GET", "projects/", "", 200},
+		{"GET", "index.html", "", 200},
+		{"GET", "missing", "", 404},
+		{"GET", "projects/missing", "", 404},
+		{"GET", "projects/../talks", "", 404},
+		{"GET", "%2Ftalks", "", 404},
+		{"POST", "projects", "", 405},
+	} {
+		req, err := http.NewRequest(test.method, server.URL()+test.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != test.status || response.Header.Get("Location") != test.location {
+			t.Fatalf("%s %s: got %d Location=%q; want %d %q", test.method, test.path, response.StatusCode, response.Header.Get("Location"), test.status, test.location)
+		}
+	}
+	for _, name := range []string{"projects", "talks"} {
+		response, err := http.Get(server.URL() + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || string(body) != name+" page" || response.Request.URL.Path != "/"+name+"/" {
+			t.Fatalf("directory redirect failed: %s %q %v", name, body, err)
 		}
 	}
 	if err := server.Close(); err != nil {

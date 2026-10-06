@@ -78,6 +78,20 @@ func handler(host string, source Source) http.Handler {
 			name += "index.html"
 		}
 		if _, err := source.Manifest().File(name); err != nil {
+			// Exact files win. Only a manifest-backed directory index warrants
+			// a redirect; the trailing slash keeps relative asset URLs correct.
+			if !strings.HasSuffix(r.URL.Path, "/") {
+				if _, indexErr := source.Manifest().File(name + "/index.html"); indexErr == nil {
+					target := *r.URL
+					target.Scheme, target.Host, target.User, target.Opaque = "", "", nil, ""
+					target.Path += "/"
+					if target.RawPath != "" {
+						target.RawPath += "/"
+					}
+					http.Redirect(w, r, target.String(), http.StatusPermanentRedirect)
+					return
+				}
+			}
 			http.NotFound(w, r)
 			return
 		}
