@@ -16,6 +16,7 @@ import (
 )
 
 type options struct {
+	cacheFile string
 	port      int
 	offline   bool
 	maxBytes  int64
@@ -63,6 +64,9 @@ func WithMaxBytes(limit int64) Option {
 
 // Transport owns one independent torrent client and borrows its collection.
 type Transport struct {
+	hints             *hints
+	useHints          bool
+	diagnostics       *discoveryStatus
 	mu                sync.Mutex
 	client            *torrent.Client
 	dht               *dht.Server
@@ -110,12 +114,23 @@ func New(ctx context.Context, stores *storage.Collection, opts ...Option) (*Tran
 	cfg.DisableTrackers = true
 	cfg.NoDHT = o.offline
 	cfg.MaxUnverifiedBytes = 8 << 20
+	hints := newHints(o.cacheFile)
+	hints.configure(cfg)
+	diagnostics := &discoveryStatus{}
+	if !o.offline {
+		diagnostics.status.RoutingReady.Started = time.Now()
+	}
+	cfg.Callbacks.CompletedHandshake = func(_ *torrent.PeerConn, hash torrent.InfoHash) {
+		diagnostics.peer(hash.HexString())
+	}
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 	lifetime, cancel := context.WithCancel(ctx)
 	t := &Transport{client: client, stores: stores, transfers: make(map[string]*Transfer), maxBytes: o.maxBytes, done: lifetime.Done(), cancel: cancel, openGate: make(chan struct{}, 1), discovery: o.discovery}
+	t.diagnostics = diagnostics
+	t.hints, t.useHints = hints, !o.offline
 	t.peerWake = make(chan struct{}, 1)
 	t.wg.Add(1)
 	go func() {
@@ -129,6 +144,15 @@ func New(ctx context.Context, stores *storage.Collection, opts ...Option) (*Tran
 		}
 	}
 	if !o.offline {
+		if t.dht != nil {
+			t.wg.Add(1)
+			go func() { defer t.wg.Done(); t.maintainHints(lifetime) }()
+			t.wg.Add(1)
+			go func() {
+				defer t.wg.Done()
+				diagnostics.routing(lifetime, func() bool { return t.dht.Stats().GoodNodes > 0 })
+			}()
+		}
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
@@ -139,7 +163,9 @@ func New(ctx context.Context, stores *storage.Collection, opts ...Option) (*Tran
 }
 
 func (t *Transport) Port() int { return t.client.LocalPort() }
-func (t *Transport) Resolve(ctx context.Context, i identity.Identity, previous identity.Record) (identity.Record, error) {
+func (t *Transport) Resolve(ctx context.Context, i identity.Identity, previous identity.Record) (record identity.Record, err error) {
+	finish := t.diagnostics.lookup()
+	defer func() { finish(err) }()
 	if t.discovery != nil {
 		r, err := t.discovery.Resolve(ctx, i, previous)
 		if err == nil {
@@ -166,7 +192,7 @@ func (t *Transport) Announce(ctx context.Context, i identity.Identity, r identit
 }
 
 // Open reuses one transfer per hash within this Transport. Transport owns handles.
-func (t *Transport) Open(ctx context.Context, hash string, validate func(content.Manifest) error) (*Transfer, error) {
+func (t *Transport) Open(ctx context.Context, hash string, validate func(content.Manifest) error) (_ *Transfer, err error) {
 	select {
 	case t.openGate <- struct{}{}:
 	case <-ctx.Done():
@@ -196,16 +222,24 @@ func (t *Transport) Open(ctx context.Context, hash string, validate func(content
 	}
 	seeding := t.seeding
 	t.mu.Unlock()
+	finish := t.diagnostics.metadata(hash, false)
+	defer func() { finish(err) }()
 	m, err := t.stores.Manifest(ctx, hash)
 	var encoded []byte
 	if err == nil {
 		encoded = m.Metadata()
+		t.diagnostics.mu.Lock()
+		t.diagnostics.status.CachedMetadata = true
+		t.diagnostics.mu.Unlock()
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	torrentHandle, _, err := t.client.AddTorrentSpec(&torrent.TorrentSpec{AddTorrentOpts: torrent.AddTorrentOpts{InfoHash: metainfo.NewHashFromHex(hash), InfoBytes: encoded, DisallowDataUpload: !seeding}})
 	if err != nil {
 		return nil, err
+	}
+	if t.useHints {
+		t.addKnownPeers(torrentHandle, hash)
 	}
 	select {
 	case <-ctx.Done():
@@ -270,6 +304,7 @@ func (t *Transport) Close() error {
 		t.closed = true
 		t.mu.Unlock()
 		t.closeErr = errors.Join(t.mappingCleanupErr, errors.Join(t.client.Close()...))
+		t.closeErr = errors.Join(t.closeErr, t.hints.save())
 	})
 	return t.closeErr
 }

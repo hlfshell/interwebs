@@ -174,6 +174,18 @@ interweb status --config interweb.yaml
 interweb status --watch --config interweb.yaml
 ```
 
+Cached verified sites open without waiting for a fresh signed-address lookup.
+Background policy checks updates for visited, favorited, and hosted sites;
+full-download sites finish their current download before checking updates.
+Signature verification and rollback protection remain mandatory. A cold site
+still needs discovery. Missing cached files still need peers.
+
+The dashboard separates signed lookup, metadata loading (cached or network),
+first peer handshake, and sampled DHT routing readiness. Timings are captured
+inside the transport, independently of the five-second status snapshots.
+They overlap: do not add them. Routing readiness means the first good routing
+node, not completion of DHT bootstrap or guaranteed public reachability.
+
 `run` and `status` show a human-readable dashboard by default. Interactive
 terminals redraw in place; redirected output contains plain snapshots without
 terminal escape codes. Use `--json` on either command for machine-readable output.

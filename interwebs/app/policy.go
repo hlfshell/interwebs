@@ -148,19 +148,23 @@ func (s *Site) maintain(ctx context.Context, now time.Time) error {
 	p.mu.Lock()
 	refresh := !e.Owned && settings.RefreshInterval > 0 && now.Sub(s.refreshed) >= settings.RefreshInterval
 	p.mu.Unlock()
-	if refresh && (e.Favorite || e.Hosting) {
+	// Restore cached service before checking for a replacement. Full-download
+	// policy finishes the current version first; foreground views can preempt it.
+	if err := n.Seed(ctx); err != nil {
+		return err
+	}
+	if !e.Owned && (e.Favorite || e.Hosting) {
+		if err := n.Download(ctx); err != nil {
+			return err
+		}
+	}
+	if refresh {
 		if _, err := n.Refresh(ctx); err != nil {
 			return err
 		}
 		p.mu.Lock()
 		s.refreshed = now
 		p.mu.Unlock()
-	}
-	if err := n.Seed(ctx); err != nil {
-		return err
-	}
-	if !e.Owned && (e.Favorite || e.Hosting) {
-		return n.Download(ctx)
 	}
 	return nil
 }

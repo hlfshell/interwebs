@@ -100,6 +100,10 @@ func TestSelectiveTransferRestartAndOfflineReseed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	diagnostic := receiver.DiscoveryStatus()
+	if diagnostic.Hash != m.Hash() || diagnostic.CachedMetadata || diagnostic.Metadata.Finished.IsZero() || diagnostic.FirstPeer.Finished.IsZero() || diagnostic.Metadata.Error != "" {
+		t.Fatalf("missing network discovery timings: %+v", diagnostic)
+	}
 	r, err := transfer.Open(ctx, "index.html")
 	if err != nil {
 		t.Fatal(err)
@@ -148,6 +152,9 @@ func TestSelectiveTransferRestartAndOfflineReseed(t *testing.T) {
 	}
 	if _, err := restored.Open(ctx, m.Hash(), siteContent.Validate); err != nil {
 		t.Fatal(err)
+	}
+	if diagnostic := restored.DiscoveryStatus(); !diagnostic.CachedMetadata || diagnostic.Metadata.Finished.IsZero() || !diagnostic.RoutingReady.Started.IsZero() {
+		t.Fatalf("incorrect offline cached diagnostics: %+v", diagnostic)
 	}
 	fresh := localTransport(t, networkStores(t, t.TempDir()))
 	go connectTransfer(ctx, fresh, m.Hash(), restored.Port())

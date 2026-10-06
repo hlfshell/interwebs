@@ -10,6 +10,7 @@ import (
 
 	core "github.com/hlfshell/interweb/interwebs"
 	"github.com/hlfshell/interweb/interwebs/app"
+	"github.com/hlfshell/interweb/interwebs/network"
 )
 
 func TestDashboardExplainsProgressWithoutConfusingPublication(t *testing.T) {
@@ -36,6 +37,32 @@ func TestDashboardExplainsProgressWithoutConfusingPublication(t *testing.T) {
 		if strings.Contains(output.String(), "\x1b") != redraw {
 			t.Fatal("unexpected terminal control codes")
 		}
+	}
+}
+
+func TestDashboardShowsDiscoveryStages(t *testing.T) {
+	now := time.Now()
+	snapshot := status{Updated: now, Sites: []siteStatus{{State: app.SiteStatus{Core: core.Status{Discovery: network.DiscoveryStatus{
+		Lookup:         network.Stage{Started: now, Elapsed: 1500 * time.Millisecond},
+		Metadata:       network.Stage{Started: now, Finished: now, Elapsed: 2 * time.Millisecond},
+		CachedMetadata: true,
+		FirstPeer:      network.Stage{Started: now, Finished: now, Error: "failed\x1b"},
+	}}}}}}
+	record, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if _, err := NewDashboard(&output, false).Write(record); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Signed lookup: 1.5s (pending)", "Metadata: 2ms (done, cached)", "First peer handshake: 0s (failed: failed )"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("missing %q in %s", want, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "\x1b") {
+		t.Fatal("untrusted terminal controls")
 	}
 }
 

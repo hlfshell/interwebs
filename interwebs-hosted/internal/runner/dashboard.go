@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/hlfshell/interweb/interwebs/network"
 )
 
 // Dashboard renders complete JSON status records as readable snapshots. Redraw
@@ -29,11 +31,11 @@ func (d *Dashboard) Write(record []byte) (int, error) {
 	if d.redraw {
 		b.WriteString("\x1b[H\x1b[2J")
 	}
-	network := "public DHT"
+	networkLabel := "public DHT"
 	if !snapshot.PublicDiscovery {
-		network = "offline"
+		networkLabel = "offline"
 	}
-	fmt.Fprintf(&b, "interweb | %s | %s | PID %d\n", clean(snapshot.Event), network, snapshot.PID)
+	fmt.Fprintf(&b, "interweb | %s | %s | PID %d\n", clean(snapshot.Event), networkLabel, snapshot.PID)
 	fmt.Fprintf(&b, "Updated %s", snapshot.Updated.Local().Format("2006-01-02 15:04:05 MST"))
 	if time.Since(snapshot.Updated) > 15*time.Second && snapshot.Event != "stopped" {
 		b.WriteString("  [STALE: runner may be unavailable]")
@@ -55,6 +57,30 @@ func (d *Dashboard) Write(record []byte) (int, error) {
 		}
 		fmt.Fprintf(&b, "  Download: %s | Peers: %d | Seeding: %s\n", progress, core.Peers, seed)
 		fmt.Fprintf(&b, "  Version: %d | Signed address announced: %d\n", core.Record.Sequence, core.AnnouncedSequence)
+		for _, item := range []struct {
+			label string
+			stage network.Stage
+		}{
+			{"DHT routing ready (sampled)", core.Discovery.RoutingReady},
+			{"Signed lookup", core.Discovery.Lookup},
+			{"Metadata", core.Discovery.Metadata},
+			{"First peer handshake", core.Discovery.FirstPeer},
+		} {
+			if item.stage.Started.IsZero() {
+				continue
+			}
+			state := "done"
+			if item.stage.Finished.IsZero() {
+				state = "pending"
+			}
+			if item.stage.Error != "" {
+				state = "failed: " + clean(item.stage.Error)
+			}
+			if item.label == "Metadata" && core.Discovery.CachedMetadata {
+				state += ", cached"
+			}
+			fmt.Fprintf(&b, "  %s: %s (%s)\n", item.label, item.stage.Elapsed.Round(time.Millisecond), state)
+		}
 		if op := site.Operation; op != nil {
 			fmt.Fprintf(&b, "  Work: %s (%s)", clean(op.Kind), clean(string(op.State)))
 			if !op.Started.IsZero() && op.Finished.IsZero() {
@@ -70,6 +96,7 @@ func (d *Dashboard) Write(record []byte) (int, error) {
 			{"Peer announcement", core.PeerAnnouncementError}, {"Signed announcement", core.AnnouncementError},
 			{"NAT mapping", core.MappingError}, {"Download", core.DownloadError},
 			{"Refresh", core.RefreshError}, {"Persistence", core.PersistenceError},
+			{"Discovery cache", core.Discovery.CacheError},
 		} {
 			if failure.message != "" {
 				fmt.Fprintf(&b, "  %s: %s\n", failure.label, clean(failure.message))

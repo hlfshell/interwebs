@@ -14,6 +14,7 @@ import (
 )
 
 type fakeNode struct {
+	refresh                                 func(context.Context) error
 	mu                                      sync.Mutex
 	seeding                                 bool
 	downloads, publishes, closes, refreshes int
@@ -38,10 +39,14 @@ func (n *fakeNode) Download(ctx context.Context) error {
 	}
 	return nil
 }
-func (n *fakeNode) Refresh(context.Context) (core.RefreshResult, error) {
+func (n *fakeNode) Refresh(ctx context.Context) (core.RefreshResult, error) {
 	n.mu.Lock()
 	n.refreshes++
+	fn := n.refresh
 	n.mu.Unlock()
+	if fn != nil {
+		return core.RefreshResult{}, fn(ctx)
+	}
 	return core.RefreshResult{Usable: true}, nil
 }
 func (n *fakeNode) Seed(context.Context) error {

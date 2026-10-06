@@ -72,6 +72,24 @@ Reapply the option when constructing the local Site after restart.
 - `Close()`: release resources, not data. Canceling the constructor context also
   closes the Node; canceling a download does not.
 
+`Status().Discovery` reports the latest signed lookup, metadata loading, and
+first peer handshake timings. Metadata is marked when loaded from storage.
+DHT routing readiness is sampled every 100ms until the first good routing node;
+it is not proof that bootstrap has finished or that a site is reachable.
+These waits overlap and must not be added. JSON durations are nanoseconds.
+
+Nodes automatically keep private discovery hints in `discovery.json` beside
+their state (not in the content stores). At most 64 confirmed DHT contacts are
+remembered for 24 hours, and 16 useful peers per immutable torrent for two hours,
+with a 512-entry total bound. Public bootstrap remains enabled alongside saved
+contacts. Peer hints are tried when opening content, alongside ordinary discovery;
+they are not guarantees of a complete seeder or permission to skip verification.
+Each node owns its own cache. Offline mode does not automatically dial saved peers.
+The cache is atomically checkpointed about once a minute and on clean shutdown;
+expired entries are ignored immediately and purged at checkpoints. It contains
+IP addresses and torrent hashes in a mode-0600 JSON file, not site payloads or keys.
+Corrupt caches are ignored; `Status().Discovery.CacheError` exposes cache failures.
+
 `Status()` separates availability, progress, authority, seeding, and download,
 refresh, persistence, announcement, and NAT mapping errors. A partial site is not
 an error. Mapping failures do not prevent outbound connections; NAT cleanup

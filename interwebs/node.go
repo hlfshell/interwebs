@@ -161,6 +161,7 @@ func New(ctx context.Context, opts ...Option) (node *Node, resultErr error) {
 		network.WithOffline(o.offline),
 		network.WithMaxBytes(o.maxBytes),
 		network.WithDiscovery(o.discovery),
+		network.WithCacheFile(filepath.Join(dir, "discovery.json")),
 	)
 	if err != nil {
 		cancel()

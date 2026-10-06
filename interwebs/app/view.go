@@ -37,16 +37,8 @@ func (s *Site) View(ctx context.Context) (*Operation, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		e, err := s.entry()
-		if err != nil {
-			return Result{}, err
-		}
-		if !e.Owned {
-			// Refresh performs signed lookup, with the core's prior-version fallback.
-			if _, err := n.Refresh(work); err != nil {
-				return Result{}, err
-			}
-		}
+		// The core reuses the verified current version, or resolves a cold site.
+		// Update checks belong to background policy, not the browser's critical path.
 		url, err := n.View(work)
 		if err != nil {
 			return Result{}, err

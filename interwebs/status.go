@@ -19,6 +19,7 @@ type Capabilities struct{ Publish, View bool }
 
 // Status is a copied, non-networking snapshot. Errors are separate from progress.
 type Status struct {
+	Discovery network.DiscoveryStatus
 	// AnnouncedSequence is zero until a signed record announcement succeeds.
 	AnnouncedSequence   int64
 	Name, Magnet, URL   string
@@ -73,6 +74,7 @@ func (n *Node) Status() Status {
 	for i, r := range s.History {
 		out.History[i] = r.Clone()
 	}
+	out.Discovery = n.transport.DiscoveryStatus()
 	if t := n.transfers[s.Current]; t != nil {
 		stats := t.Stats()
 		out.Bytes, out.Total, out.Peers = stats.Bytes, stats.Total, stats.Peers
