@@ -1,6 +1,21 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {cleanupDue,cleanupOnce,finalizeRun,cleanupResources,provisioningGuard} from './remote-lifecycle.mjs';
+import {cleanupDue,cleanupOnce,finalizeRun,cleanupResources,provisioningGuard,createWithKeyRetry} from './remote-lifecycle.mjs';
+
+test('key propagation retries only explicit rejections and stays bounded',async()=>{
+  const rejection=Object.assign(new Error('create rejected'),{stdout:'422 invalid key identifiers for Droplet creation'});
+  let attempts=0,pauses=0;
+  const pause=async ms=>{assert.equal(ms,10000);pauses++;};
+  assert.equal(await createWithKeyRetry(async()=>{if(++attempts<3)throw rejection;return 'created';},pause),'created');
+  assert.equal(attempts,3);assert.equal(pauses,2);
+  attempts=0;
+  await assert.rejects(createWithKeyRetry(async()=>{attempts++;throw rejection;},pause),rejection);
+  assert.equal(attempts,6);
+  attempts=0;
+  const timeout=new Error('create timed out; outcome unknown');
+  await assert.rejects(createWithKeyRetry(async()=>{attempts++;throw timeout;},pause),timeout);
+  assert.equal(attempts,1);
+});
 
 test('retained publishers require explicit cleanup',()=>{
   const m={keepHostRequested:true,expiresAt:null};
@@ -37,6 +52,20 @@ test('one API failure does not skip other resources or mark cleanup complete',as
 });
 test('key-only provisioning failure is cleaned safely',async()=>{
   const e=environment({tagOnly:true});await cleanupResources(e.m,e.deps);assert.deepEqual(e.deleted,['3','test-run']);
+});
+test('recorded imported key is deleted even before it appears in list',async()=>{
+  const e=environment({tagOnly:true});e.m.keyID=3;
+  const original=e.deps.doctl;let reads=0;
+  e.deps.doctl=async(...args)=>args[1]==='ssh-key'&&++reads===1?[]:original(...args);
+  await cleanupResources(e.m,e.deps);
+  assert.deepEqual(e.deleted,['3','test-run']);assert.deepEqual(e.m.deletedKeyIDs,[3]);assert.ok(e.m.cleanedAt);
+});
+test('an invisible imported key with failed deletion cannot be marked cleaned',async()=>{
+  const e=environment({tagOnly:true,failID:3});e.m.keyID=3;
+  const original=e.deps.doctl;
+  e.deps.doctl=async(...args)=>args[1]==='ssh-key'?[]:original(...args);
+  await assert.rejects(cleanupResources(e.m,e.deps),AggregateError);
+  assert.equal(e.m.cleanedAt,undefined);assert.ok(e.m.cleanupErrors.length);
 });
 test('key deletion verification tolerates an eventually consistent list',async()=>{
   const e=environment({tagOnly:true});const original=e.deps.doctl;let keyReads=0;

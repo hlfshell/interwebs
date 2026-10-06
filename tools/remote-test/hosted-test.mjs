@@ -2,17 +2,18 @@
 // receiver, no injected peers or metadata. Everything billed is uniquely tagged.
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdir,readFile,writeFile,rename,stat,appendFile} from 'node:fs/promises';
-import {resolve,join} from 'node:path';
+import {mkdir,readFile,writeFile,rename,stat,appendFile,readdir} from 'node:fs/promises';
+import {resolve,join,dirname} from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {cleanupOnce,cleanupResources,provisioningGuard} from './remote-lifecycle.mjs';
+import {cleanupOnce,cleanupResources,provisioningGuard,createWithKeyRetry} from './remote-lifecycle.mjs';
 import {checkBrowser,checkRange} from './hosted-browser.mjs';
 
 const root=resolve(import.meta.dirname,'../..');
 const args=process.argv.slice(2);
 const keepHost=args.includes('--keep-host');
-if(args.some(arg=>arg.startsWith('--')&&arg!=='--keep-host'))throw Error('Unknown option');
-const source=resolve(args.find(arg=>arg!=='--keep-host')||join(root,'test_sites/blog'));
+const measureDiscovery=args.includes('--measure-discovery');
+if(args.some(arg=>arg.startsWith('--')&&!['--keep-host','--measure-discovery'].includes(arg)))throw Error('Unknown option');
+const source=resolve(args.find(arg=>!arg.startsWith('--'))||join(root,'test_sites/blog'));
 const tag=`interweb-test-${Date.now()}-${randomUUID()}`;
 const dir=join(root,'tools/.remote-runs',tag);
 await mkdir(dir,{recursive:true,mode:0o700});
@@ -28,11 +29,11 @@ const provisioning=provisioningGuard();
 let receiver,receiverExit,ip,hostRetained=false;
 async function stopReceiver(){if(!receiver)return;const child=receiver;receiver=null;child.kill('SIGTERM');const timer=setTimeout(()=>child.kill('SIGKILL'),10000);try{await receiverExit;}finally{clearTimeout(timer);}}
 const finish=cleanupOnce(async()=>{await provisioning.drain();await stopReceiver();await cleanupResources(manifest,{doctl,command,pause,save,log:console.log});});
-for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{finish().then(()=>process.exit(130)).catch(e=>{console.error(e);process.exit(1);});});
-const deadline=setTimeout(()=>{console.error('45-minute test deadline');finish().then(()=>process.exit(1)).catch(e=>{console.error(e);process.exit(1);});},45*60*1000);
+for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{(hostRetained?stopReceiver():finish()).then(()=>process.exit(130)).catch(e=>{console.error(e);process.exit(1);});});
+const deadline=setTimeout(()=>{console.error('45-minute test deadline');(hostRetained?stopReceiver():finish()).then(()=>process.exit(1)).catch(e=>{console.error(e);process.exit(1);});},45*60*1000);
 const options=['-F','/dev/null','-i',join(dir,'key'),'-o','IdentitiesOnly=yes','-o','BatchMode=yes','-o','ConnectTimeout=8','-o','ServerAliveInterval=15','-o','ServerAliveCountMax=3','-o','StrictHostKeyChecking=accept-new','-o',`UserKnownHostsFile=${join(dir,'known_hosts')}`];
 const ssh=cmd=>command('ssh',[...options,`root@${ip}`,cmd]);
-async function until(label,fn,seconds=240){const end=Date.now()+seconds*1000;let last;while(Date.now()<end){if(provisioning.closing)throw Error('Shutting down');try{const result=await fn();if(result)return result;}catch(e){last=e.message;}await pause(5000);}throw Error(`${label} timed out: ${last??'not ready'}`);}
+async function until(label,fn,seconds=240,interval=5000){const end=Date.now()+seconds*1000;let last;while(Date.now()<end){if(provisioning.closing)throw Error('Shutting down');try{const result=await fn();if(result)return result;}catch(e){last=e.message;}await pause(interval);}throw Error(`${label} timed out: ${last??'not ready'}`);}
 const localStatus=async()=>JSON.parse(await readFile(join(dir,'receiver-data/runner-status.json'),'utf8'));
 const remoteStatus=async()=>JSON.parse(await ssh('cat /root/interweb-data/runner-status.json'));
 async function startReceiver(magnet,hosting){
@@ -54,7 +55,7 @@ try {
   manifest.keyID=key.id;await save(manifest);
   // Allow imported keys to become visible to droplet provisioning.
   await pause(5000);
-  const [droplet]=await provisioning.track(()=>doctl('compute','droplet','create',tag,'--size',size.slug,'--image','ubuntu-24-04-x64','--region','nyc3','--ssh-keys',String(key.id),'--tag-name',tag));
+  const [droplet]=await createWithKeyRetry(()=>provisioning.track(()=>doctl('compute','droplet','create',tag,'--size',size.slug,'--image','ubuntu-24-04-x64','--region','nyc3','--ssh-keys',String(key.id),'--tag-name',tag)),pause);
   manifest.droplets.push({id:droplet.id});await save(manifest);
   ip=await until('VM readiness',async()=>{const [d]=await doctl('compute','droplet','get',String(droplet.id));return d.status==='active'&&d.networks.v4.find(n=>n.type==='public')?.ip_address;});
   manifest.droplets[0].ip=ip;await save(manifest);
@@ -77,7 +78,8 @@ try {
   manifest.results.publicationMs=Date.now()-began;
   const magnet=published.sites[0].state.Core.Magnet;
   manifest.magnet=magnet;manifest.hash=published.sites[0].state.Core.Current;await save(manifest);
-  if(keepHost) {
+  if(keepHost) { hostRetained=true; manifest.retainedAt=new Date().toISOString(); await save(manifest); }
+  if(keepHost&&!measureDiscovery) {
     await ssh('curl --fail --silent --output /dev/null http://127.0.0.1:8082/');
     manifest.retainedAt=new Date().toISOString();await save(manifest);
     hostRetained=true;
@@ -87,7 +89,7 @@ try {
   const discoveryStart=Date.now();await startReceiver(magnet,false);
   const ready=await until('cold signed discovery and index',async()=>{const s=await localStatus();return s.event!=='stopped'&&s.sites[0].phase==='ready'&&s.sites[0].state.Core.Current===manifest.hash&&s;},360);
   const origin=ready.sites[0].url;
-  manifest.results.coldView={elapsedMs:Date.now()-discoveryStart,bytes:ready.sites[0].state.Core.Bytes,total:ready.sites[0].state.Core.Total,origin};await save(manifest);
+  manifest.results.coldView={elapsedMs:Date.now()-discoveryStart,bytes:ready.sites[0].state.Core.Bytes,total:ready.sites[0].state.Core.Total,origin,discovery:ready.sites[0].state.Core.Discovery};await save(manifest);
   console.log('Cold view ready:',manifest.results.coldView);
   manifest.results.staticBrowser=await checkBrowser(origin,source,join(dir,'homepage-static.png'),{blockVideo:true});await save(manifest);
   console.log('Non-video homepage:',manifest.results.staticBrowser.localAssetsPass,manifest.results.staticBrowser.loadMs,'ms');
@@ -97,12 +99,49 @@ try {
   manifest.results.videoRanges=[await checkRange(origin,source,video,0,1<<20),await checkRange(origin,source,video,videoSize-(64<<10),64<<10)];await save(manifest);
   console.log('Video range checks:',manifest.results.videoRanges);
   await writeFile(join(dir,'peer-sockets.txt'),(await command('ss',['-tanp'])).split('\n').filter(l=>l.includes(ip)||l.includes('interweb')).join('\n'));
+  if(measureDiscovery) {
+    console.log('Waiting for confirmed DHT contacts to be checkpointed');
+    const cachePath=await until('DHT cache checkpoint',async()=>{
+      const files=await readdir(join(dir,'receiver-data'),{recursive:true});
+      for(const file of files.filter(f=>f.endsWith('/discovery.json'))) {
+        const path=join(dir,'receiver-data',file), entries=JSON.parse(await readFile(path,'utf8'));
+        if(entries.some(e=>!e.Hash)&&entries.some(e=>e.Hash===manifest.hash))return path;
+      }
+    },180,1000);
+    await stopReceiver();
+    const hints=JSON.parse(await readFile(cachePath,'utf8')), nodeDir=dirname(cachePath);
+    manifest.results.hintCounts={dht:hints.filter(e=>!e.Hash).length,peers:hints.filter(e=>e.Hash===manifest.hash).length};
+    manifest.results.discoveryTrials=[]; await save(manifest);
+    // Preserve every store: move whole node directories, never delete them.
+    // Each trial starts without signed state, metainfo or payloads; only hints vary.
+    for(const [number,mode] of ['none','dht','both','both','dht','none'].entries()) {
+      const baseline=join(dir,`baseline-${number}`);
+      await rename(nodeDir,baseline); await mkdir(nodeDir,{recursive:true,mode:0o700});
+      const selected=mode==='none'?[]:hints.filter(e=>mode==='both'||!e.Hash);
+      await writeFile(join(nodeDir,'discovery.json'),JSON.stringify(selected),{mode:0o600});
+      const began=Date.now();
+      try {
+        await startReceiver(magnet,false);
+        const status=await until(`discovery trial ${number}`,async()=>{const s=await localStatus();return s.pid===receiver.pid&&s.sites[0].phase==='ready'&&s.sites[0].state.Core.Current===manifest.hash&&s;},360,100);
+        const index=await checkRange(status.sites[0].url,source,'/index.html',0,(await stat(join(source,'index.html'))).size);
+        const result={mode,elapsedMs:Date.now()-began,index,discovery:status.sites[0].state.Core.Discovery,bytes:status.sites[0].state.Core.Bytes};
+        manifest.results.discoveryTrials.push(result); await save(manifest);
+        console.log('Discovery trial:',JSON.stringify(result));
+      } finally {
+        await stopReceiver(); await rename(nodeDir,join(dir,`trial-${number}-${mode}-node`)); await rename(baseline,nodeDir);
+      }
+    }
+    const began=Date.now();await startReceiver(magnet,false);
+    const warm=await until('cached restart',async()=>{const s=await localStatus();return s.pid===receiver.pid&&s.sites[0].phase==='ready'&&s;},120,100);
+    manifest.results.cachedRestart={elapsedMs:Date.now()-began,discovery:warm.sites[0].state.Core.Discovery};await save(manifest);
+    console.log('Cached restart:',JSON.stringify(manifest.results.cachedRestart));
+  }
   await stopReceiver();await startReceiver(magnet,true);
   const downloadStart=Date.now();const samples=[];
   const complete=await until('whole-site download',async()=>{const s=await localStatus();const c=s.sites[0].state.Core;const sample={elapsedMs:Date.now()-downloadStart,bytes:c.Bytes,total:c.Total,peers:c.Peers,error:s.sites[0].error};samples.push(sample);await writeFile(join(dir,'download-samples.json'),JSON.stringify(samples,null,2));if(Date.now()-lastReport>30000){console.log('Full download:',sample);lastReport=Date.now();}return s.event!=='stopped'&&c.Total>0&&c.Bytes===c.Total&&s;},900);
   manifest.results.fullDownload={elapsedMs:Date.now()-downloadStart,bytes:complete.sites[0].state.Core.Bytes};
-  manifest.passed=manifest.results.staticBrowser.localAssetsPass&&manifest.results.normalBrowser.localAssetsPass&&manifest.results.videoRanges.every(r=>r.match);
+  manifest.passed=manifest.results.staticBrowser.localAssetsPass&&manifest.results.normalBrowser.localAssetsPass&&manifest.results.videoRanges.every(r=>r.match)&&(manifest.results.discoveryTrials??[]).every(r=>r.index.match);
   await save(manifest);console.log('Full test result:',manifest.passed?'PASS':'FAIL (see browser evidence)');
   }
 }catch(error){manifest.failure=error.message;await save(manifest);throw error;}
-finally{clearTimeout(deadline);if(!hostRetained)await finish();}
+finally{clearTimeout(deadline);if(!hostRetained)await finish();else {await stopReceiver();console.log('Publisher retained:',JSON.stringify({ip,magnet:manifest.magnet,manifest:join(dir,'manifest.json'),hourlyCost:manifest.hourlyCost}));}}
